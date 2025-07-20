@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+find_package(OpenSSL REQUIRED)
+
 # Main UDP async sketch
 add_executable(udp_sketch udp_async_sketch.cpp)
 
@@ -16,6 +18,10 @@ add_executable(udp_echo_test udp_echo_test.cpp)
 
 # Demo test
 add_executable(udp_demo udp_async_demo.cpp)
+
+# DTLS sketch
+add_executable(dtls_sketch dtls_sketch.cpp)
+target_link_libraries(dtls_sketch OpenSSL::SSL OpenSSL::Crypto pthread)
 
 # Platform-specific libraries
 if(UNIX AND NOT APPLE)
