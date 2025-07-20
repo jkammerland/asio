@@ -29,16 +29,19 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include "self_signed_cert.hpp"
+
 #define SERVER_PORT 4433
 #define BUFFER_SIZE 2048
 #define COOKIE_SECRET_LENGTH 16
 
 // Server configuration
-static const char *cert_file = "server-cert.pem";
-static const char *key_file = "server-key.pem";
-static const char *ca_file = "ca-cert.pem";
 static int verbose = 0;
 static unsigned char cookie_secret[COOKIE_SECRET_LENGTH];
+
+// In-memory certificates
+static dtls::certificate_data server_cert;
+static dtls::certificate_data ca_cert;
 
 // Structure to pass client information to threads
 typedef struct {
@@ -88,24 +91,35 @@ SSL_CTX *create_context(void) {
   SSL_CTX_set_min_proto_version(ctx, DTLS1_2_VERSION);
   SSL_CTX_set_max_proto_version(ctx, DTLS1_2_VERSION);
 
-  // Set certificate and key
-  if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {
-    fprintf(stderr, "Failed to load certificate file: %s\n", cert_file);
-    ERR_print_errors_fp(stderr);
-    SSL_CTX_free(ctx);
-    return NULL;
+  // Generate certificates if not already done
+  if (!server_cert.is_valid()) {
+    if (verbose) {
+      printf("Generating server certificate...\n");
+    }
+    server_cert = dtls::generate_self_signed_cert("dtls-server", 365, 2048);
+    if (!server_cert.is_valid()) {
+      fprintf(stderr, "Failed to generate server certificate\n");
+      SSL_CTX_free(ctx);
+      return NULL;
+    }
   }
 
-  if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) <= 0) {
-    fprintf(stderr, "Failed to load private key file: %s\n", key_file);
-    ERR_print_errors_fp(stderr);
-    SSL_CTX_free(ctx);
-    return NULL;
+  if (!ca_cert.is_valid()) {
+    if (verbose) {
+      printf("Generating CA certificate...\n");
+    }
+    ca_cert = dtls::generate_ca_cert("Test DTLS CA", 3650, 2048);
+    if (!ca_cert.is_valid()) {
+      fprintf(stderr, "Failed to generate CA certificate\n");
+      SSL_CTX_free(ctx);
+      return NULL;
+    }
   }
 
-  // Verify private key matches certificate
-  if (!SSL_CTX_check_private_key(ctx)) {
-    fprintf(stderr, "Private key does not match certificate\n");
+  // Use in-memory certificate and key
+  if (!dtls::use_certificate_data(ctx, server_cert)) {
+    fprintf(stderr, "Failed to use server certificate\n");
+    ERR_print_errors_fp(stderr);
     SSL_CTX_free(ctx);
     return NULL;
   }
@@ -115,9 +129,9 @@ SSL_CTX *create_context(void) {
                      verify_certificate);
   SSL_CTX_set_verify_depth(ctx, 4);
 
-  // Load CA certificates
-  if (!SSL_CTX_load_verify_locations(ctx, ca_file, NULL)) {
-    fprintf(stderr, "Failed to load CA certificates\n");
+  // Add CA certificate for verification
+  if (!dtls::add_ca_certificate(ctx, ca_cert)) {
+    fprintf(stderr, "Failed to add CA certificate\n");
     ERR_print_errors_fp(stderr);
   }
 
@@ -353,7 +367,7 @@ cleanup:
   }
 
   printf("Client thread ended for %s\n", addr_to_string(&info->client_addr));
-  free(info);
+  delete info;
   return NULL;
 }
 
@@ -447,9 +461,11 @@ int main(int argc, char *argv[]) {
   }
 
   printf("DTLS Echo Server listening on port %d\n", port);
-  printf("Certificate file: %s\n", cert_file);
-  printf("Private key file: %s\n", key_file);
-  printf("CA file: %s\n", ca_file);
+  printf("Using in-memory generated certificates\n");
+  if (verbose) {
+    printf("Server certificate CN: dtls-server\n");
+    printf("CA certificate CN: Test DTLS CA\n");
+  }
 
   // Main server loop
   while (1) {
@@ -531,7 +547,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Prepare client info for thread
-    client_info = malloc(sizeof(client_info_t));
+    client_info = new client_info_t;
     if (!client_info) {
       fprintf(stderr, "Failed to allocate client info\n");
       close(client_fd);
@@ -556,7 +572,7 @@ int main(int argc, char *argv[]) {
     if (pthread_create(&thread, NULL, handle_client, client_info) != 0) {
       perror("pthread_create");
       close(client_fd);
-      free(client_info);
+      delete client_info;
       continue;
     }
 
