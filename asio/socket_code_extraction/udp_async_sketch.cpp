@@ -10,10 +10,16 @@
 #include <span>
 #include <system_error>
 #include <variant>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/time.h>
+#else
+#include <winsock2.h>
 #endif
 
 // Common types
@@ -263,6 +269,8 @@ public:
 
   struct send_operation : operation {
     completion_handler handler;
+    sockaddr_storage addr;
+    socklen_t addr_len;
 
     void complete(int32_t result) override {
       std::error_code ec;
@@ -282,8 +290,11 @@ public:
   struct receive_operation : operation {
     receive_handler handler;
     sockaddr_storage addr;
+    socklen_t addr_len;
     struct msghdr msg;
     struct iovec iov;
+    
+    receive_operation() : addr_len(sizeof(addr)) {}
 
     void complete(int32_t result) override {
       std::error_code ec;
@@ -299,6 +310,8 @@ public:
           auto *sin = reinterpret_cast<sockaddr_in *>(&addr);
           ep.address = ntohl(sin->sin_addr.s_addr);
           ep.port = ntohs(sin->sin_port);
+          // Also copy the sockaddr_in structure for sendto
+          ep.sin = *sin;
         }
       }
 
@@ -334,10 +347,22 @@ public:
     op->type = op_send;
     op->handler = std::move(handler);
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(ep.address);
-    addr.sin_port = htons(ep.port);
+    // Copy endpoint data to operation for persistence
+    if (ep.sin.sin_family == AF_INET) {
+      // Use the pre-filled sockaddr from recvmsg
+      memcpy(&op->addr, &ep.sin, sizeof(sockaddr_in));
+      op->addr_len = sizeof(sockaddr_in);
+
+    } else {
+      // Construct sockaddr from address/port
+      sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(&op->addr);
+      memset(addr, 0, sizeof(sockaddr_in));
+      addr->sin_family = AF_INET;
+      addr->sin_addr.s_addr = htonl(ep.address);
+      addr->sin_port = htons(ep.port);
+      op->addr_len = sizeof(sockaddr_in);
+
+    }
 
     io_uring_sqe *sqe = io_uring_get_sqe(ring_);
     if (!sqe) {
@@ -346,7 +371,7 @@ public:
     }
 
     io_uring_prep_sendto(sqe, fd_, data.data(), data.size(), 0,
-                         (sockaddr *)&addr, sizeof(addr));
+                         (sockaddr*)&op->addr, op->addr_len);
     io_uring_sqe_set_data(sqe, op);
   }
 
@@ -362,21 +387,20 @@ public:
     }
 
     // For UDP, we need to use recvmsg to get sender address
-    struct msghdr msg = {};
-    struct iovec iov = {};
-    iov.iov_base = data.data();
-    iov.iov_len = data.size();
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_name = &op->addr;
-    msg.msg_namelen = sizeof(op->addr);
-
-    // Store msg in operation for later use
     auto *recv_op = static_cast<receive_operation *>(op);
-    recv_op->msg = msg;
-    recv_op->iov = iov;
+    
+    // Setup iovec for the data buffer
+    recv_op->iov.iov_base = data.data();
+    recv_op->iov.iov_len = data.size();
+    
+    // Setup msghdr - must be done after iov is set up
+    memset(&recv_op->msg, 0, sizeof(recv_op->msg));
+    recv_op->msg.msg_name = &recv_op->addr;
+    recv_op->msg.msg_namelen = recv_op->addr_len;
+    recv_op->msg.msg_iov = &recv_op->iov;
+    recv_op->msg.msg_iovlen = 1;
 
+    // Use recvmsg to get sender address
     io_uring_prep_recvmsg(sqe, fd_, &recv_op->msg, 0);
     io_uring_sqe_set_data(sqe, op);
   }
@@ -722,7 +746,99 @@ public:
 // Usage Example
 // =============================================================================
 
-void example_usage() {
+// Test client that runs in separate thread
+class test_client {
+  int fd_;
+  std::atomic<bool> success_{false};
+  std::atomic<bool> done_{false};
+  
+public:
+  test_client() : fd_(-1) {
+    fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd_ < 0) {
+      throw std::system_error(errno, std::generic_category(), "Failed to create client socket");
+    }
+  }
+  
+  ~test_client() {
+    if (fd_ >= 0) {
+#ifdef _WIN32
+      closesocket(fd_);
+#else
+      close(fd_);
+#endif
+    }
+  }
+  
+  bool run_test() {
+    // Wait a bit for server to start
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // Server address
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+    server_addr.sin_port = htons(8080);
+    
+    // Test message
+    const char* test_msg = "Hello, UDP Echo Server!";
+    size_t msg_len = strlen(test_msg);
+    
+    // Send test message
+    ssize_t sent = sendto(fd_, test_msg, msg_len, 0,
+                         (sockaddr*)&server_addr, sizeof(server_addr));
+    if (sent != static_cast<ssize_t>(msg_len)) {
+      std::cerr << "Client: Failed to send test message\n";
+      done_ = true;
+      return false;
+    }
+    
+    std::cout << "Client: Sent '" << test_msg << "'\n";
+    
+    // Set receive timeout
+#ifdef _WIN32
+    DWORD timeout = 2000; // 2 seconds
+    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    
+    // Receive echo
+    char recv_buffer[1024];
+    sockaddr_storage from_addr{};
+    socklen_t from_len = sizeof(from_addr);
+    
+    ssize_t received = recvfrom(fd_, recv_buffer, sizeof(recv_buffer), 0,
+                               (sockaddr*)&from_addr, &from_len);
+    
+    if (received < 0) {
+      std::cerr << "Client: Timeout or error receiving echo\n";
+      done_ = true;
+      return false;
+    }
+    
+    // Verify echo
+    if (received == static_cast<ssize_t>(msg_len) && 
+        memcmp(recv_buffer, test_msg, msg_len) == 0) {
+      std::cout << "Client: Received correct echo: '" 
+                << std::string(recv_buffer, received) << "'\n";
+      success_ = true;
+    } else {
+      std::cerr << "Client: Echo mismatch!\n";
+    }
+    
+    done_ = true;
+    return success_;
+  }
+  
+  bool is_done() const { return done_; }
+  bool is_success() const { return success_; }
+};
+
+int example_usage() {
 #ifdef _WIN32
   iocp_event_loop loop;
 #elif defined(__linux__)
@@ -737,31 +853,86 @@ void example_usage() {
   endpoint bind_ep{0, 8080}; // 0.0.0.0:8080
   socket->bind(bind_ep);
 
+  // Server state
+  std::atomic<bool> server_running{true};
+  std::atomic<int> messages_processed{0};
+  
   // Async receive
   std::byte recv_buffer[1024];
-  socket->async_receive_from(
-      recv_buffer,
-      [&](std::error_code ec, size_t bytes_received, endpoint from) {
-        if (!ec) {
-          std::cout << "Received " << bytes_received << " bytes from "
-                    << from.address << ":" << from.port << "\n";
+  std::function<void()> start_receive;
+  
+  start_receive = [&]() {
+    socket->async_receive_from(
+        recv_buffer,
+        [&](std::error_code ec, size_t bytes_received, endpoint from) {
+          if (!ec) {
+            std::cout << "Server: Received " << bytes_received << " bytes from "
+                      << from.address << ":" << from.port << "\n";
+            
+            messages_processed++;
+            
+            // Echo back
 
-          // Echo back
-          socket->async_send_to({recv_buffer, bytes_received}, from,
-                                [](std::error_code ec, size_t bytes_sent) {
-                                  if (!ec) {
-                                    std::cout << "Sent " << bytes_sent
-                                              << " bytes\n";
-                                  }
-                                });
-        }
-      });
+            socket->async_send_to({recv_buffer, bytes_received}, from,
+                                  [&](std::error_code ec, size_t bytes_sent) {
+                                    if (!ec) {
+                                      std::cout << "Server: Sent " << bytes_sent
+                                                << " bytes\n";
+                                    } else {
+                                      std::cerr << "Server: Send error: " << ec.message() << "\n";
+                                    }
+                                  });
+            
+            // Continue receiving if server is still running
+            if (server_running) {
+              start_receive();
+            }
+          } else if (server_running) {
+            std::cerr << "Server: Receive error: " << ec.message() << "\n";
+          }
+        });
+  };
+  
+  start_receive();
 
-  // Run event loop
-  loop.run();
+  // Run server in background thread
+  std::thread server_thread([&]() {
+    std::cout << "Server: Starting on port 8080...\n";
+    loop.run();
+    std::cout << "Server: Stopped. Processed " << messages_processed << " messages.\n";
+  });
+  
+  // Run client test
+  test_client client;
+  std::thread client_thread([&]() {
+    client.run_test();
+  });
+  
+  // Wait for client to complete
+  client_thread.join();
+  
+  // Stop server
+  server_running = false;
+  loop.stop();
+  
+  // Give server time to process stop
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  
+  // Join server thread
+  server_thread.join();
+  
+  // Return based on test result
+  return client.is_success() ? 0 : 1;
 }
 
+#ifndef SKIP_MAIN
 int main() {
-  example_usage();
-  return 0;
+  int result = example_usage();
+  if (result == 0) {
+    std::cout << "\nTEST PASSED: Client-server handshake successful!\n";
+  } else {
+    std::cerr << "\nTEST FAILED: Client-server handshake failed!\n";
+  }
+  return result;
 }
+#endif // SKIP_MAIN
